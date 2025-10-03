@@ -1,82 +1,225 @@
-Projeto: Monitoramento de Vagas de Estacionamento com IoT
-Status: Versão 1.0 - Funcional
 
-Este projeto implementa um sistema de Internet das Coisas (IoT) de ponta-a-ponta para monitorar o status de vagas de estacionamento em tempo real. Utilizando um microcontrolador ESP32 com sensores, os dados são capturados, enviados para a nuvem através do protocolo MQTT e persistidos em um banco de dados serverless.
 
-O resultado é uma solução escalável e eficiente para consultar a ocupação de vagas a partir de dados gerados por hardware de baixo custo.
+# --- 1. FERRAMENTAS E PRÉ-REQUISITOS ---
 
-Arquitetura da Solução
-O fluxo de dados segue a seguinte arquitetura:
+# - Node.js & NPM: para gerenciar o Wrangler
+# - Wrangler CLI: ferramenta de linha de comando da Cloudflare
+# - Python 3 & PIP: para o script da ponte (bridge) MQTT
+# - Arduino IDE: para o firmware do ESP32 (com suporte para ESP32 instalado)
+# - Git: para controle de versão
 
-[ESP32 com Sensores] → [Broker MQTT] → [Ponte Node.js] → [Cloudflare Worker] → [Cloudflare D1]
+# -----------------------------------------------------------------------------
+# --- 2. BACKEND: CLOUDFLARE WORKER & D1 DATABASE ---
+# -----------------------------------------------------------------------------
 
-Tecnologias Utilizadas
-Hardware: ESP32
+# Instalar/Atualizar o Wrangler CLI
+npm install -g wrangler
 
-Comunicação IoT: Protocolo MQTT (utilizando o broker público test.mosquitto.org)
+# Autenticar com sua conta Cloudflare
+wrangler login
 
-Ponte (Bridge): Node.js (mqtt.js, axios)
+# Comandos SQL para criar a tabela no dashboard do D1
+# Cole isso na console do seu banco de dados D1.
+# NOME DO BANCO (exemplo): garagem-db
+#
+# CREATE TABLE vagas (
+#   id TEXT PRIMARY KEY,
+#   status TEXT NOT NULL,
+#   distancia_cm INTEGER,
+#   nivel_ruido_raw INTEGER,
+#   ultima_atualizacao TEXT
+# );
 
-Plataforma Serverless: Cloudflare Workers
+# Arquivo de configuração `wrangler.toml`
+# Este arquivo define seu projeto e conecta o Worker ao D1.
+# Crie este arquivo na raiz do seu projeto.
+# SUBSTITUA os valores de 'name', 'database_name' e 'database_id'.
 
-Banco de Dados: Cloudflare D1 (SQLite Serverless)
+cat <<EOF > wrangler.toml
+name = "garagem-worker" # Nome do seu Worker
+main = "src/index.js"
+compatibility_date = "2023-10-26"
 
-Linguagens: C/C++ (Arduino para ESP32), JavaScript (Node.js e Cloudflare Worker)
+[[d1_databases]]
+binding = "DB" # Nome da variável para acessar o DB no código do worker
+database_name = "garagem-db"
+database_id = "SEU_DATABASE_ID_AQUI"
+EOF
 
-Componentes Detalhados
-Cada parte do projeto tem uma função específica e essencial para o funcionamento do todo.
+# O código do Worker (src/index.js) não está aqui para brevidade.
+# Use o código completo da conversa anterior.
 
-1. ESP32 (O Sensor Inteligente)
-O que é? O ESP32 é um microcontrolador de baixo custo com Wi-Fi e Bluetooth integrados, ideal para projetos de IoT. Ele é o "cérebro" da operação no local da vaga.
+# Fazer o deploy do Worker para a nuvem da Cloudflare
+wrangler deploy
 
-Qual seu papel?
+# -----------------------------------------------------------------------------
+# --- 3. PONTE (BRIDGE): MQTT PARA HTTP ---
+# -----------------------------------------------------------------------------
 
-Ler os Sensores: Ele lê continuamente os dados de sensores acoplados (como um sensor ultrassônico para medir a distância de um veículo).
+# Instalar dependências Python
+pip install paho-mqtt requests
 
-Processar os Dados: Com base na distância lida, o código no ESP32 determina o status da vaga ("LIVRE" ou "OCUPADA").
+# Script da ponte: `bridge.py`
+# Este script escuta o tópico MQTT e envia os dados para o Worker.
+# SUBSTITUA a 'WORKER_URL' pela URL fornecida após o `wrangler deploy`.
 
-Enviar a Informação: Ele se conecta à rede Wi-Fi, formata os dados em um padrão universal (JSON) e os publica em um tópico MQTT específico, enviando a informação para a internet.
+cat <<EOF > bridge.py
+import paho.mqtt.client as mqtt
+import requests
+import json
+import time
 
-2. MQTT (O Carteiro da IoT)
-O que é? MQTT (Message Queuing Telemetry Transport) é um protocolo de mensagens extremamente leve, projetado para dispositivos com poucos recursos. Ele funciona no modelo "Publicar/Assinar" (Publish/Subscribe).
+# --- CONFIGURAÇÕES ---
+MQTT_BROKER = "broker.hivemq.com"
+MQTT_PORT = 1883
+MQTT_TOPIC = "estacionamento/status_vaga"
+# MUDE A URL ABAIXO PARA A URL DO SEU WORKER
+WORKER_URL = "https://garagem-worker.seu-subdominio.workers.dev/"
 
-Qual seu papel?
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        print(f"Conectado ao Broker MQTT: {MQTT_BROKER}")
+        client.subscribe(MQTT_TOPIC)
+    else:
+        print(f"Falha na conexão, código de retorno: {rc}")
 
-Desacoplamento: O ESP32 (publicador) não precisa saber quem vai receber a informação. Ele apenas envia a mensagem para um "endereço" (o tópico MQTT, ex: garagem/vagas/status) em um servidor central (o Broker MQTT).
+def on_message(client, userdata, msg):
+    payload_str = msg.payload.decode('utf-8')
+    print(f"Recebido [{msg.topic}]: {payload_str}")
+    try:
+        data = json.loads(payload_str)
+        response = requests.post(WORKER_URL, json=data, timeout=10)
+        print(f"POST para Worker -> Status: {response.status_code}, Resposta: {response.text}")
+    except Exception as e:
+        print(f"ERRO: {e}")
 
-Eficiência: Garante uma comunicação rápida e com baixo consumo de dados e energia, perfeita para o ESP32.
+client = mqtt.Client(client_id=f"bridge-{int(time.time())}")
+client.on_connect = on_connect
+client.on_message = on_message
+client.connect(MQTT_BROKER, MQTT_PORT, 60)
+client.loop_forever()
+EOF
 
-3. Ponte (Bridge) Node.js (O Tradutor)
-O que é? É um script simples em Node.js que roda em uma máquina (pode ser seu PC ou um servidor).
+# Executar a ponte
+# Mantenha este terminal aberto para a ponte continuar funcionando.
+# python bridge.py
 
-Qual seu papel?
+# -----------------------------------------------------------------------------
+# --- 4. FIRMWARE: ESP32 (ARDUINO/C++) ---
+# -----------------------------------------------------------------------------
 
-Ouvir o Carteiro: A ponte "assina" o mesmo tópico MQTT que o ESP32 está publicando. Sua única função é ficar ouvindo as mensagens que chegam.
+# Bibliotecas necessárias na Arduino IDE:
+# - PubSubClient (de Nick O'Leary)
+# - ArduinoJson (de Benoit Blanchon)
 
-Traduzir e Encaminhar: Quando uma mensagem do ESP32 chega via MQTT, a ponte a "traduz" para o mundo da web, convertendo-a em uma requisição HTTP POST e a envia para a URL pública do nosso Cloudflare Worker. Ela serve como uma ponte entre o protocolo MQTT (do mundo IoT) e o protocolo HTTP (do mundo web).
+# Código do Firmware: `esp32_firmware.ino`
+# Cole este código na sua Arduino IDE.
+# SUBSTITUA as configurações de WiFi, MQTT e o ID da vaga.
 
-4. Cloudflare Worker (O Processador na Nuvem)
-Aqui, dividimos em duas partes: o código e a execução.
+cat <<EOF > esp32_firmware.ino
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 
-Código-Fonte (Pasta Local no PC)
-É a "planta baixa" do nosso serviço. A pasta no seu computador contém os arquivos index.js e wrangler.jsonc, onde escrevemos a lógica que será executada. Todo o desenvolvimento é feito localmente.
+// --- CONFIGURAÇÕES - ALTERE AQUI ---
+const char* WIFI_SSID = "NOME_DA_SUA_REDE_WIFI";
+const char* WIFI_PASSWORD = "SENHA_DA_SUA_REDE_WIFI";
+const char* MQTT_BROKER = "broker.hivemq.com";
+const char* VAGA_ID = "Vaga-01"; // ID único para esta vaga
 
-Execução na Nuvem
-Após o comando npx wrangler deploy, esse código passa a existir e rodar na rede global da Cloudflare.
+// --- PINOS ---
+const int PIN_TRIG = 5;
+const int PIN_ECHO = 18;
+const int PIN_SOM = 19;
 
-Receber a Requisição: Ele possui uma URL pública e fica aguardando as requisições HTTP POST enviadas pela nossa "Ponte".
+// --- PARÂMETROS ---
+const int DISTANCIA_CARRO_CM = 50;
 
-Validar os Dados: Ele recebe o corpo da requisição, interpreta o JSON e verifica se os dados essenciais (id, status) estão presentes.
+WiFiClient espClient;
+PubSubClient client(espClient);
+String statusAtual = "";
+String ultimoStatusEnviado = "";
 
-Comunicar com o Banco: Ele é o único componente que tem a "chave" para acessar e dar comandos ao nosso banco de dados D1.
+void setupWifi() {
+  Serial.print("Conectando a ");
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi conectado!");
+}
 
-5. Cloudflare D1 (A Memória Permanente)
-O que é? Um banco de dados SQL serverless oferecido pela Cloudflare, baseado em SQLite.
+void reconnectMqtt() {
+  while (!client.connected()) {
+    Serial.print("Tentando conexão MQTT...");
+    if (client.connect("ESP32Client-Vaga01")) {
+      Serial.println("Conectado!");
+    } else {
+      Serial.print("Falhou, rc=");
+      Serial.print(client.state());
+      Serial.println(" Tentando novamente em 5 segundos");
+      delay(5000);
+    }
+  }
+}
 
-Qual seu papel?
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  pinMode(PIN_SOM, INPUT);
+  setupWifi();
+  client.setServer(MQTT_BROKER, 1883);
+}
 
-Armazenar os Dados: Recebe os comandos SQL do Cloudflare Worker.
+void loop() {
+  if (!client.connected()) {
+    reconnectMqtt();
+  }
+  client.loop();
 
-Persistência: Executa a query INSERT ... ON CONFLICT DO UPDATE, que insere uma nova vaga se ela não existir, ou apenas atualiza o status e o horário da última atualização se a vaga já estiver registrada.
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+  long distancia = pulseIn(PIN_ECHO, HIGH) * 0.034 / 2;
+  bool somDetectado = (digitalRead(PIN_SOM) == LOW);
 
-Fonte da Verdade: Guarda o estado mais recente de todas as vagas, permitindo que, no futuro, outras aplicações (como um painel web ou um aplicativo) possam consultá-lo para mostrar quais vagas estão livres ou ocupadas.
+  if (distancia < DISTANCIA_CARRO_CM) {
+    statusAtual = somDetectado ? "Movimentacao" : "Ocupada";
+  } else {
+    statusAtual = "Livre";
+  }
+
+  if (statusAtual != ultimoStatusEnviado) {
+    StaticJsonDocument<200> doc;
+    doc["id"] = VAGA_ID;
+    doc["status"] = statusAtual;
+    doc["distancia_cm"] = distancia;
+
+    char buffer[256];
+    serializeJson(doc, buffer);
+    
+    client.publish("estacionamento/status_vaga", buffer);
+    ultimoStatusEnviado = statusAtual;
+    Serial.print("Publicado: ");
+    Serial.println(buffer);
+  }
+  delay(2000);
+}
+EOF
+
+# -----------------------------------------------------------------------------
+# --- 5. ORDEM DE EXECUÇÃO ---
+# -----------------------------------------------------------------------------
+
+echo "GUIA DE EXECUÇÃO:"
+echo "1. Faça o deploy do Cloudflare Worker com 'wrangler deploy'."
+echo "2. Execute a ponte MQTT com 'python bridge.py' em um terminal."
+echo "3. Compile e envie o firmware para o ESP32 pela Arduino IDE."
+echo "4. Monitore os logs e acesse o painel na URL do seu Worker (ex: https://garagem-worker.seu-subdominio.workers.dev/vagas)."
+
+# --- FIM DO GUIA ---
